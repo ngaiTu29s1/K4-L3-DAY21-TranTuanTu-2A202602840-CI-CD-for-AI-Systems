@@ -1,12 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from google.cloud import storage
 import joblib
 import os
+from pathlib import Path
 
-app = FastAPI()
+app = FastAPI(title="Adult Income Classifier")
 
-ARTIFACT_BUCKET = os.environ["ARTIFACT_BUCKET"]
+ARTIFACT_BUCKET = os.environ.get("ARTIFACT_BUCKET", "income-artifacts")
 MODEL_KEY = "artifacts/current/model.joblib"
 MODEL_PATH = os.path.expanduser("~/models/model.joblib")
 
@@ -14,28 +14,51 @@ MODEL_PATH = os.path.expanduser("~/models/model.joblib")
 def download_model():
     """
     Tai file model.joblib tu cloud storage ve may khi server khoi dong.
-
-    Ham nay duoc goi mot lan khi module duoc import. Su dung
-    GOOGLE_APPLICATION_CREDENTIALS de xac thuc (duoc dat trong systemd service).
+    Ho tro ca Azure Blob Storage va Google Cloud Storage.
     """
-    # TODO 1: Tao storage.Client()
-    # client = storage.Client()
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
 
-    # TODO 2: Lay bucket va blob tuong ung
-    # bucket = client.bucket(ARTIFACT_BUCKET)
-    # blob   = bucket.blob(MODEL_KEY)
+    # 1. Thu voi Azure Blob Storage
+    azure_conn = os.environ.get("AZURE_STORAGE_CONNECTION_STRING") or os.environ.get("STORAGE_CREDENTIALS")
+    if azure_conn and "EndpointSuffix=" in azure_conn:
+        try:
+            from azure.storage.blob import BlobServiceClient
+            service_client = BlobServiceClient.from_connection_string(azure_conn)
+            blob_client = service_client.get_blob_client(container=ARTIFACT_BUCKET, blob=MODEL_KEY)
+            with open(MODEL_PATH, "wb") as f:
+                data = blob_client.download_blob()
+                data.readinto(f)
+            print("Model da duoc tai xuong tu Azure Blob Storage.")
+            return
+        except Exception as e:
+            print(f"Loi tai tu Azure Blob: {e}")
 
-    # TODO 3: Tai file model xuong may
-    # blob.download_to_filename(MODEL_PATH)
+    # 2. Thu voi Google Cloud Storage
+    if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS") or os.environ.get("STORAGE_CREDENTIALS"):
+        try:
+            from google.cloud import storage
+            client = storage.Client()
+            bucket = client.bucket(ARTIFACT_BUCKET)
+            blob = bucket.blob(MODEL_KEY)
+            blob.download_to_filename(MODEL_PATH)
+            print("Model da duoc tai xuong tu Google Cloud Storage.")
+            return
+        except Exception as e:
+            print(f"Loi tai tu GCS: {e}")
 
-    # TODO 4: In thong bao thanh cong
-    # print("Model da duoc tai xuong tu cloud storage.")
-
-    pass  # xoa dong nay sau khi hoan thanh tat ca TODO ben tren
+    print("Khong the tai model tu Cloud Storage hoac chua co cau hinh.")
 
 
-download_model()
-model = joblib.load(MODEL_PATH)
+# Tai model khi khoi dong neu chua co hoac khi service duoc reload
+try:
+    download_model()
+except Exception as e:
+    print(f"Download model exception: {e}")
+
+if os.path.exists(MODEL_PATH):
+    model = joblib.load(MODEL_PATH)
+else:
+    model = None
 
 
 class ScoreRequest(BaseModel):
@@ -47,11 +70,14 @@ def healthz():
     """
     Endpoint kiem tra suc khoe server.
     GitHub Actions goi endpoint nay sau khi deploy de xac nhan server dang chay.
-
-    Tra ve: {"status": "ok"}
     """
-    # TODO 5: Tra ve dict {"status": "ok"}
-    pass  # xoa dong nay sau khi hoan thanh
+    global model
+    if model is None and os.path.exists(MODEL_PATH):
+        try:
+            model = joblib.load(MODEL_PATH)
+        except Exception:
+            pass
+    return {"status": "ok"}
 
 
 @app.post("/score")
@@ -61,22 +87,24 @@ def score(req: ScoreRequest):
 
     Dau vao : JSON {"features": [f1, f2, ..., f10]}
     Dau ra  : JSON {"prediction": <0|1>, "label": <"thu_nhap_thap"|"thu_nhap_cao">}
-
-    Thu tu 10 dac trung (khop voi thu tu trong FEATURE_NAMES cua test):
-        age, workclass, education_num, marital_status, occupation,
-        relationship, sex, capital_gain, capital_loss, hours_per_week
     """
-    # TODO 6: Kiem tra so luong dac trung.
-    # Neu len(req.features) != 10, raise HTTPException(status_code=400, ...)
+    global model
+    if model is None:
+        if os.path.exists(MODEL_PATH):
+            model = joblib.load(MODEL_PATH)
+        else:
+            raise HTTPException(status_code=503, detail="Model is not loaded")
 
-    # TODO 7: Goi model.predict([req.features]) de lay ket qua du doan.
-    # pred = model.predict(...)
+    if len(req.features) != 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Expected 10 features (adult income)"
+        )
 
-    # TODO 8: Tra ve dict chua "prediction" (int) va "label" (string).
-    # Nhan tuong ung: 0 -> "thu_nhap_thap", 1 -> "thu_nhap_cao"
-    # return {"prediction": ..., "label": ...}
+    pred = int(model.predict([req.features])[0])
+    label = "thu_nhap_cao" if pred == 1 else "thu_nhap_thap"
 
-    pass  # xoa dong nay sau khi hoan thanh tat ca TODO ben tren
+    return {"prediction": pred, "label": label}
 
 
 if __name__ == "__main__":
